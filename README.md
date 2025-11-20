@@ -4,7 +4,9 @@ cloudflare workers proxy
 第一步，将workrs.txt的代码完整复制粘贴到workers里面\
 第二步，启动ech-workers客户端，启动参数-h看帮助文件
 
-Usage of ./ech-workers: \
+Usage:\ 
+
+./ech-workers: \
   -dns string
         ECH 查询 DNS 服务器 (default "119.29.29.29:53")\
   -ech string
