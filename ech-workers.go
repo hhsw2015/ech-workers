@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -12,6 +14,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +42,7 @@ func init() {
 	flag.StringVar(&serverAddr, "f", "", "服务端地址 (格式: x.x.workers.dev:443)")
 	flag.StringVar(&serverIP, "ip", "", "指定服务端 IP（绕过 DNS 解析）")
 	flag.StringVar(&token, "token", "", "身份验证令牌")
-	flag.StringVar(&dnsServer, "dns", "119.29.29.29:53", "ECH 查询 DNS 服务器")
+	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
 }
 
@@ -126,25 +130,53 @@ func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, erro
 	}, nil
 }
 
+// queryHTTPSRecord 通过 DoH 查询 HTTPS 记录
 func queryHTTPSRecord(domain, dnsServer string) (string, error) {
-	query := buildDNSQuery(domain, typeHTTPS)
+	dohURL := dnsServer
+	if !strings.HasPrefix(dohURL, "https://") && !strings.HasPrefix(dohURL, "http://") {
+		dohURL = "https://" + dohURL
+	}
+	return queryDoH(domain, dohURL)
+}
 
-	conn, err := net.Dial("udp", dnsServer)
+// queryDoH 执行 DoH 查询（用于获取 ECH 配置）
+func queryDoH(domain, dohURL string) (string, error) {
+	u, err := url.Parse(dohURL)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("无效的 DoH URL: %v", err)
 	}
-	defer conn.Close()
+	
+	dnsQuery := buildDNSQuery(domain, typeHTTPS)
+	dnsBase64 := base64.RawURLEncoding.EncodeToString(dnsQuery)
 
-	if _, err = conn.Write(query); err != nil {
-		return "", err
-	}
+	q := u.Query()
+	q.Set("dns", dnsBase64)
+	u.RawQuery = q.Encode()
 
-	response := make([]byte, 4096)
-	n, err := conn.Read(response)
+	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("创建请求失败: %v", err)
 	}
-	return parseDNSResponse(response[:n])
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Content-Type", "application/dns-message")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("DoH 请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("DoH 服务器返回错误: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("读取 DoH 响应失败: %v", err)
+	}
+
+	return parseDNSResponse(body)
 }
 
 func buildDNSQuery(domain string, qtype uint16) []byte {
@@ -234,6 +266,74 @@ func parseHTTPSRecord(data []byte) string {
 		}
 	}
 	return ""
+}
+
+// ======================== DoH 代理支持 ========================
+
+// queryDoHForProxy 通过 ECH 转发 DNS 查询到 Cloudflare DoH
+func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
+	_, port, _, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 构建 DoH URL
+	dohURL := fmt.Sprintf("https://cloudflare-dns.com:%s/dns-query", port)
+
+	echBytes, err := getECHList()
+	if err != nil {
+		return nil, fmt.Errorf("获取 ECH 配置失败: %w", err)
+	}
+
+	tlsCfg, err := buildTLSConfigWithECH("cloudflare-dns.com", echBytes)
+	if err != nil {
+		return nil, fmt.Errorf("构建 TLS 配置失败: %w", err)
+	}
+
+	// 创建 HTTP 客户端
+	transport := &http.Transport{
+		TLSClientConfig: tlsCfg,
+	}
+
+	// 如果指定了 IP，使用自定义 Dialer
+	if serverIP != "" {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			dialer := &net.Dialer{
+				Timeout: 10 * time.Second,
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
+		}
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+
+	// 发送 DoH 请求
+	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(dnsQuery))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("DoH 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH 响应错误: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
 }
 
 // ======================== WebSocket 客户端 ========================
@@ -447,25 +547,186 @@ func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) {
 	}
 	port := int(buf[0])<<8 | int(buf[1])
 
-	var target string
-	if atyp == 0x04 {
-		target = fmt.Sprintf("[%s]:%d", host, port)
-	} else {
-		target = fmt.Sprintf("%s:%d", host, port)
-	}
+	switch command {
+	case 0x01: // CONNECT
+		var target string
+		if atyp == 0x04 {
+			target = fmt.Sprintf("[%s]:%d", host, port)
+		} else {
+			target = fmt.Sprintf("%s:%d", host, port)
+		}
 
-	if command != 0x01 {
+		log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
+
+		if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, ""); err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
+			}
+		}
+
+	case 0x03: // UDP ASSOCIATE
+		handleUDPAssociate(conn, clientAddr)
+
+	default:
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		return
 	}
+}
 
-	log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
+func handleUDPAssociate(tcpConn net.Conn, clientAddr string) {
+	// 创建 UDP 监听器
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		log.Printf("[UDP] %s 解析地址失败: %v", clientAddr, err)
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
 
-	if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, ""); err != nil {
-		if !isNormalCloseError(err) {
-			log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Printf("[UDP] %s 监听失败: %v", clientAddr, err)
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+
+	// 获取实际监听的端口
+	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	port := localAddr.Port
+
+	log.Printf("[UDP] %s UDP ASSOCIATE 监听端口: %d", clientAddr, port)
+
+	// 发送成功响应
+	response := []byte{0x05, 0x00, 0x00, 0x01}
+	response = append(response, 127, 0, 0, 1) // 127.0.0.1
+	response = append(response, byte(port>>8), byte(port&0xff))
+
+	if _, err := tcpConn.Write(response); err != nil {
+		udpConn.Close()
+		return
+	}
+
+	// 启动 UDP 处理
+	stopChan := make(chan struct{})
+	go handleUDPRelay(udpConn, clientAddr, stopChan)
+
+	// 保持 TCP 连接，直到客户端关闭
+	buf := make([]byte, 1)
+	tcpConn.Read(buf)
+
+	close(stopChan)
+	udpConn.Close()
+	log.Printf("[UDP] %s UDP ASSOCIATE 连接关闭", clientAddr)
+}
+
+func handleUDPRelay(udpConn *net.UDPConn, clientAddr string, stopChan chan struct{}) {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+		}
+
+		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, addr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return
+		}
+
+		// 解析 SOCKS5 UDP 请求头
+		if n < 10 {
+			continue
+		}
+
+		// SOCKS5 UDP 请求格式:
+		// +----+------+------+----------+----------+----------+
+		// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+		// +----+------+------+----------+----------+----------+
+		// | 2  |  1   |  1   | Variable |    2     | Variable |
+		// +----+------+------+----------+----------+----------+
+
+		data := buf[:n]
+
+		if data[2] != 0x00 { // FRAG 必须为 0
+			continue
+		}
+
+		atyp := data[3]
+		var headerLen int
+		var dstHost string
+		var dstPort int
+
+		switch atyp {
+		case 0x01: // IPv4
+			if n < 10 {
+				continue
+			}
+			dstHost = net.IP(data[4:8]).String()
+			dstPort = int(data[8])<<8 | int(data[9])
+			headerLen = 10
+
+		case 0x03: // 域名
+			if n < 5 {
+				continue
+			}
+			domainLen := int(data[4])
+			if n < 7+domainLen {
+				continue
+			}
+			dstHost = string(data[5 : 5+domainLen])
+			dstPort = int(data[5+domainLen])<<8 | int(data[6+domainLen])
+			headerLen = 7 + domainLen
+
+		case 0x04: // IPv6
+			if n < 22 {
+				continue
+			}
+			dstHost = net.IP(data[4:20]).String()
+			dstPort = int(data[20])<<8 | int(data[21])
+			headerLen = 22
+
+		default:
+			continue
+		}
+
+		udpData := data[headerLen:]
+		target := fmt.Sprintf("%s:%d", dstHost, dstPort)
+
+		// 检查是否是 DNS 查询（端口 53）
+		if dstPort == 53 {
+			log.Printf("[UDP-DNS] %s -> %s (DoH 查询)", clientAddr, target)
+			go handleDNSQuery(udpConn, addr, udpData, data[:headerLen])
+		} else {
+			log.Printf("[UDP] %s -> %s (暂不支持非 DNS UDP)", clientAddr, target)
+			// 这里可以扩展支持其他 UDP 流量
 		}
 	}
+}
+
+func handleDNSQuery(udpConn *net.UDPConn, clientAddr *net.UDPAddr, dnsQuery []byte, socks5Header []byte) {
+	// 通过 DoH 查询（使用重命名后的函数）
+	dnsResponse, err := queryDoHForProxy(dnsQuery)
+	if err != nil {
+		log.Printf("[UDP-DNS] DoH 查询失败: %v", err)
+		return
+	}
+
+	// 构建 SOCKS5 UDP 响应
+	response := make([]byte, 0, len(socks5Header)+len(dnsResponse))
+	response = append(response, socks5Header...)
+	response = append(response, dnsResponse...)
+
+	// 发送响应
+	_, err = udpConn.WriteToUDP(response, clientAddr)
+	if err != nil {
+		log.Printf("[UDP-DNS] 发送响应失败: %v", err)
+		return
+	}
+
+	log.Printf("[UDP-DNS] DoH 查询成功，响应 %d 字节", len(dnsResponse))
 }
 
 // ======================== HTTP 处理 ========================
