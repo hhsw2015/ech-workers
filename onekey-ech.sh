@@ -35,7 +35,7 @@ case "$(uname -m)" in
 	x86_64 | x64 | amd64 )
 	if [ ! -f "ech-server-linux" ]
 	then
-	curl -L https://www.baipiao.eu.org/ech/ech-server-linux-amd64 -o ech-server-linux
+	curl -L https://github.com/hhsw2015/ech-workers/blob/main/ech-server-linux-amd64 -o ech-server-linux
 	fi
 	if [ ! -f "opera-linux" ]
 	then
@@ -49,7 +49,7 @@ case "$(uname -m)" in
 	i386 | i686 )
 	if [ ! -f "ech-server-linux" ]
 	then
-	curl -L https://www.baipiao.eu.org/ech/ech-server-linux-386 -o ech-server-linux
+	curl -L https://github.com/hhsw2015/ech-workers/blob/main/ech-server-linux-386 -o ech-server-linux
 	fi
 	if [ ! -f "opera-linux" ]
 	then
@@ -63,7 +63,7 @@ case "$(uname -m)" in
 	armv8 | arm64 | aarch64 )
 	if [ ! -f "ech-server-linux" ]
 	then
-	curl -L https://www.baipiao.eu.org/ech/ech-server-linux-arm64 -o ech-server-linux
+	curl -L https://github.com/hhsw2015/ech-workers/blob/main/ech-server-linux-arm64 -o ech-server-linux
 	fi
 	if [ ! -f "opera-linux" ]
 	then
