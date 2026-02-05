@@ -1168,6 +1168,10 @@ func (p *ECHPool) RegisterAndClaim(connID, target, firstFrame string, tcpConn ne
 			continue
 		}
 		p.mu.Lock()
+		// 检查并确保 claimTimes[connID] 不为 nil（防止高并发时被其他 goroutine 删除）
+		if p.claimTimes[connID] == nil {
+			p.claimTimes[connID] = make(map[int]time.Time)
+		}
 		p.claimTimes[connID][i] = time.Now()
 		p.mu.Unlock()
 		p.wsMutexes[i].Lock()
